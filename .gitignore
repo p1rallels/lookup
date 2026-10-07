@@ -1,0 +1,23 @@
+# build
+/target/
+**/*.rs.bk
+*.pdb
+
+# session data / exports (may contain PII)
+*.jsonl
+*.jsonl.gz
+sessions/
+.pi/
+
+# env / secrets
+.env
+.env.*
+*.pem
+*.key
+
+# editor / os
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
