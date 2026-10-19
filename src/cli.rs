@@ -76,7 +76,7 @@ pub struct SearchArgs {
         long,
         value_delimiter = ',',
         value_name = "KIND",
-        help = "user, assistant, thinking, tool-call, tool-result, summary"
+        help = "user, assistant, thinking, tool-call, tool-result, summary, custom"
     )]
     pub kind: Vec<Kind>,
 
@@ -182,10 +182,19 @@ pub struct CatchupArgs {
     pub session: Option<String>,
 
     #[arg(
+        short,
+        long,
+        value_delimiter = ',',
+        value_name = "KIND",
+        help = "Kinds to emit [default: user, assistant and msg messages]; custom adds every custom message, relay's too"
+    )]
+    pub kind: Vec<Kind>,
+
+    #[arg(
         short = 'n',
         long,
         default_value_t = 20,
-        help = "Recent user and assistant records to emit; 0 is unlimited"
+        help = "Recent records to emit; 0 is unlimited"
     )]
     pub limit: usize,
 
@@ -432,19 +441,23 @@ pub enum Kind {
     ToolCall,
     ToolResult,
     Summary,
+    /// An extension's custom message (msg, relay, …), or a msg message a msg
+    /// tool's result carried.
+    Custom,
 }
 
 impl Kind {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::User,
         Self::Assistant,
         Self::Thinking,
         Self::ToolCall,
         Self::ToolResult,
         Self::Summary,
+        Self::Custom,
     ];
 
-    pub const DEFAULT: [Self; 3] = [Self::User, Self::Assistant, Self::ToolCall];
+    pub const DEFAULT: [Self; 4] = [Self::User, Self::Assistant, Self::ToolCall, Self::Custom];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -454,6 +467,7 @@ impl Kind {
             Self::ToolCall => "tool-call",
             Self::ToolResult => "tool-result",
             Self::Summary => "summary",
+            Self::Custom => "custom",
         }
     }
 }

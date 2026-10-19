@@ -1,4 +1,5 @@
 mod cli;
+mod custom;
 mod engine;
 mod naming;
 mod output;
@@ -14,8 +15,9 @@ use cli::{
     StatsArgs, SummarizeArgs, selected_kinds,
 };
 use engine::{
-    Record, SearchOptions, search, select_session, session_digest, session_matches,
-    session_metrics, session_records, session_title, validate_bound, within_bounds,
+    CONVERSATION, Record, SearchOptions, conversation, search, select_session, session_digest,
+    session_matches, session_metrics, session_records, session_title, validate_bound,
+    within_bounds,
 };
 use naming::{Names, iso_timestamp};
 use output::{
@@ -134,12 +136,7 @@ fn search_command(scope: &Scope<'_>, args: &SearchArgs) -> Result<()> {
 }
 
 fn catchup_command(scope: &Scope<'_>, args: &CatchupArgs) -> Result<()> {
-    let file = target_session_file(scope, args.session.as_deref(), "catchup")?;
-    let records = last_records(
-        session_records(&file, &[Kind::User, Kind::Assistant])?,
-        args.limit,
-    );
-    let names = display_names(scope.roots, [file.cwd.clone()], args.json);
+    let (records, names) = catchup(scope, args)?;
     print_records(
         &records,
         &timeline_display(
@@ -297,6 +294,25 @@ fn projects_command(scope: &Scope<'_>, args: &ProjectsArgs) -> Result<()> {
     print_projects(&rows, args.json, &names)
 }
 
+/// A session's recent records, and the names to print them with.
+fn catchup(scope: &Scope<'_>, args: &CatchupArgs) -> Result<(Vec<Record>, Names)> {
+    let file = target_session_file(scope, args.session.as_deref(), "catchup")?;
+    let records = last_records(catchup_records(&file, &args.kind)?, args.limit);
+    let names = display_names(scope.roots, [file.cwd.clone()], args.json);
+    Ok((records, names))
+}
+
+/// The conversation by default; exactly the kinds asked for otherwise.
+fn catchup_records(file: &SessionFile, kinds: &[Kind]) -> Result<Vec<Record>> {
+    match kinds.is_empty() {
+        true => Ok(session_records(file, &CONVERSATION)?
+            .into_iter()
+            .filter(conversation)
+            .collect()),
+        false => session_records(file, kinds),
+    }
+}
+
 fn search_kinds(args: &SearchArgs) -> Result<Vec<Kind>> {
     let kinds = match (args.errors, args.kind.is_empty() && !args.all_kinds) {
         (true, true) => vec![Kind::ToolResult],
@@ -405,4 +421,105 @@ fn is_broken_pipe(error: &anyhow::Error) -> bool {
             .downcast_ref::<io::Error>()
             .is_some_and(|error| error.kind() == io::ErrorKind::BrokenPipe)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Scope, catchup, sessions_roots, timeline_display};
+    use crate::{
+        cli::{Cli, Command, Kind},
+        output::write_records,
+    };
+    use clap::Parser;
+    use std::path::PathBuf;
+
+    const TANDEM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/tandem");
+    const MAIN: &str = "01a15300-0000-7000-8000-00000000000a";
+
+    /// Runs a catchup command line the way `lookup` does, printing plain
+    /// text as when its output is piped.
+    fn catchup_text(line: &[&str]) -> String {
+        let cli = Cli::try_parse_from(line).unwrap();
+        let Command::Catchup(args) = cli.command else {
+            panic!("expected catchup");
+        };
+        let roots = sessions_roots(cli.root).unwrap();
+        assert_eq!(roots, [PathBuf::from(TANDEM)]);
+        let scope = Scope {
+            roots: &roots,
+            selectors: &cli.project,
+            all_projects: cli.all_projects,
+        };
+        let (records, names) = catchup(&scope, &args).unwrap();
+        let display = timeline_display(
+            &names,
+            args.context,
+            args.full,
+            args.json,
+            args.max_text,
+            args.metadata_only,
+        );
+        let mut text = Vec::new();
+        write_records(&mut text, &records, &display, false).unwrap();
+        String::from_utf8(text).unwrap()
+    }
+
+    /// What relay runs after a reset and pastes into the fresh context: the
+    /// session folder as the root, the conversation with msg traffic in it,
+    /// relay's own messages and the compaction left out.
+    #[test]
+    fn relays_catchup_call_reads_the_session_folder_as_plain_text() {
+        let text = catchup_text(&["lookup", "--root", TANDEM, "catchup", MAIN, "-n", "30"]);
+        assert_eq!(
+            text,
+            "\
+2026-10-19 06:30:01  tandem  01a15300:2  user
+  fan out csv and db to two forks, merge what lands, report when both are in
+2026-10-19 06:30:05  tandem  01a15300:3  assistant
+  Spawning csv and db in forks 1 and 2.
+2026-10-19 06:31:00  tandem  01a15300:5  msg csv \u{2192} you
+  keep the header row in the output?
+2026-10-19 06:31:11  tandem  01a15300:7  msg you \u{2192} 01a15301
+  yes, keep the header row
+2026-10-19 06:40:00  tandem  01a15300:9  msg csv ended
+  done: csv parser in src/csv.rs, 3 files, tests pass. kept the header row.
+2026-10-19 06:41:00  tandem  01a15300:10  msg db died
+  db's process is gone without ending (pid 4242)
+2026-10-19 06:42:00  tandem  01a15300:11  msg user (via 01a152ff) \u{2192} you
+  merge csv now, rerun db after
+2026-10-19 06:44:00  tandem  01a15300:13  assistant
+  Merged csv (fast-forward). db died; relaying before I rerun it.
+2026-10-19 06:44:30  tandem  01a15300:17  assistant
+  Picking up after the reset: rerunning db in fork 2.
+"
+        );
+        let after = catchup_text(&["lookup", "catchup", MAIN, "--root", TANDEM, "-n", "2"]);
+        assert_eq!(after.lines().count(), 4);
+    }
+
+    #[test]
+    fn catchup_shows_relay_only_when_asked() {
+        let text = catchup_text(&["lookup", "--root", TANDEM, "catchup", MAIN, "-k", "custom"]);
+        let labels = text
+            .lines()
+            .filter(|line| !line.starts_with(' '))
+            .map(|line| line.splitn(4, "  ").last().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            labels,
+            [
+                "msg csv \u{2192} you",
+                "msg you \u{2192} 01a15301",
+                "msg csv ended",
+                "msg db died",
+                "msg user (via 01a152ff) \u{2192} you",
+                "relay 45% nudge",
+                "relay 48% reset #1",
+                "handoff",
+            ]
+        );
+        let users = catchup_text(&["lookup", "--root", TANDEM, "catchup", MAIN, "-k", "user"]);
+        assert_eq!(users.lines().count(), 2);
+        assert_eq!(Kind::ALL.last(), Some(&Kind::Custom));
+    }
 }

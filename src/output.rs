@@ -9,8 +9,11 @@ use serde::Serialize;
 
 use crate::{
     cli::Kind,
-    engine::{Failures, Outcome, Record, SessionDigest, SessionMetrics, Usage, compact},
-    naming::{Names, display_timestamp},
+    custom::{Msg, Relay, msg_label, relay_label, reset_label},
+    engine::{
+        Failures, MsgTraffic, Outcome, Peer, Record, SessionDigest, SessionMetrics, Usage, compact,
+    },
+    naming::{Names, SHORT_ID, display_timestamp, short_id},
 };
 
 const FINAL_MESSAGE_BYTES: usize = 4000;
@@ -42,6 +45,12 @@ struct JsonRecord<'a> {
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     error: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    custom_type: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    msg: Option<&'a Msg>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    relay: Option<&'a Relay>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     text: Option<&'a str>,
     text_bytes: usize,
     text_truncated: bool,
@@ -70,16 +79,31 @@ pub struct ProjectRow<'a> {
 
 pub fn print_records(records: &[Record], options: &DisplayOptions<'_>) -> Result<()> {
     let stdout = io::stdout();
-    let mut output = io::BufWriter::new(stdout.lock());
+    let color = stdout.is_terminal() && env::var_os("NO_COLOR").is_none();
+    write_records(
+        &mut io::BufWriter::new(stdout.lock()),
+        records,
+        options,
+        color,
+    )
+}
+
+/// JSONL, or a header line per record and its text indented under it. Plain
+/// text (no color) is what relay pastes into a fresh context.
+pub fn write_records(
+    output: &mut impl Write,
+    records: &[Record],
+    options: &DisplayOptions<'_>,
+    color: bool,
+) -> Result<()> {
     if options.json {
         for record in records {
-            serde_json::to_writer(&mut output, &json_record(record, options))?;
+            serde_json::to_writer(&mut *output, &json_record(record, options))?;
             writeln!(output)?;
         }
         return Ok(());
     }
 
-    let color = io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none();
     let matcher = build_matcher(options)?;
     for record in records {
         let timestamp = display_timestamp(&record.timestamp);
@@ -97,7 +121,7 @@ pub fn print_records(records: &[Record], options: &DisplayOptions<'_>) -> Result
             options.names.label(&record.cwd, &record.project),
             options.names.id(&record.session),
             record.line,
-            record.kind.label(),
+            record_label(record, options.names),
         );
         if color {
             writeln!(output, "\x1b[2m{header}\x1b[0m")?;
@@ -135,10 +159,28 @@ fn json_record<'a>(record: &'a Record, options: &DisplayOptions<'_>) -> JsonReco
         kind: record.kind,
         tool: record.tool.as_deref(),
         error: record.error,
+        custom_type: record.custom_type.as_deref(),
+        msg: record.msg.as_ref(),
+        relay: record.relay.as_ref(),
         text,
         text_bytes: record.text.len(),
         text_truncated: text.is_none_or(|text| text.len() < record.text.len()),
         path: &record.path,
+    }
+}
+
+/// The kind, or for custom records and relay's compactions what they are:
+/// `msg scout → you`, `relay 45% nudge`, `relay reset #2 at 48%`.
+fn record_label(record: &Record, names: &Names) -> String {
+    match (record.kind, &record.msg, &record.relay) {
+        (Kind::Custom, Some(msg), _) => msg_label(msg, &record.session, names),
+        (Kind::Custom, None, Some(relay)) => relay_label(relay),
+        (Kind::Custom, None, None) => record
+            .custom_type
+            .clone()
+            .unwrap_or_else(|| Kind::Custom.label().to_owned()),
+        (Kind::Summary, _, Some(relay)) => reset_label(relay),
+        (kind, _, _) => kind.label().to_owned(),
     }
 }
 
@@ -211,9 +253,10 @@ pub fn print_metrics(metrics: &SessionMetrics, json: bool) -> Result<()> {
         .saturating_add(counts.thinking_level_changes);
     writeln!(
         output,
-        "events: {} total  {} messages  {} compactions  {} lifecycle/config  {} unknown",
+        "events: {} total  {} messages  {} custom messages  {} compactions  {} lifecycle/config  {} unknown",
         counts.events,
         counts.message_events,
+        counts.custom_messages,
         counts.compactions,
         lifecycle_events,
         counts.other_events,
@@ -229,6 +272,15 @@ pub fn print_metrics(metrics: &SessionMetrics, json: bool) -> Result<()> {
         "content: {} assistant text  {} thinking  {} tool calls",
         counts.assistant_text_parts, counts.thinking_blocks, counts.tool_calls,
     )?;
+    if !counts.custom_types.is_empty() {
+        let types = counts
+            .custom_types
+            .iter()
+            .map(|(custom_type, count)| format!("{count} {custom_type}"))
+            .collect::<Vec<_>>()
+            .join("  ");
+        writeln!(output, "custom messages: {types}")?;
+    }
     writeln!(
         output,
         "lifecycle: {} session starts  {} model changes  {} thinking-level changes",
@@ -238,9 +290,14 @@ pub fn print_metrics(metrics: &SessionMetrics, json: bool) -> Result<()> {
     if !metrics.models.is_empty() {
         writeln!(output, "models: {}", metrics.models.join(", "))?;
     }
+    let by_relay = match counts.relay_resets {
+        0 => String::new(),
+        1 => " (1 relay reset)".to_owned(),
+        resets => format!(" ({resets} relay resets)"),
+    };
     writeln!(
         output,
-        "compactions: {} total, {} listed",
+        "compactions: {} total{by_relay}, {} listed",
         counts.compactions, metrics.compactions_listed,
     )?;
     if !metrics.compactions.is_empty() {
@@ -265,10 +322,15 @@ pub fn print_metrics(metrics: &SessionMetrics, json: bool) -> Result<()> {
             .as_deref()
             .map(|reason| format!("/{reason}"))
             .unwrap_or_default();
+        let relay = compaction
+            .relay
+            .as_ref()
+            .map(|relay| format!("  {}", reset_label(relay)))
+            .unwrap_or_default();
         writeln!(
             output,
-            "  #{:<3} {:<32} {:>11}  {:>11}  {:>4}  {}{}",
-            compaction.number, compaction.finished_at, gap, tokens, hook, previous, reason,
+            "  #{:<3} {:<32} {:>11}  {:>11}  {:>4}  {}{}{}",
+            compaction.number, compaction.finished_at, gap, tokens, hook, previous, reason, relay,
         )?;
     }
     if !metrics.compactions.is_empty() {
@@ -306,6 +368,7 @@ pub fn print_digest(digest: &SessionDigest, json: bool) -> Result<()> {
         "tool-call",
         "tool-result",
         "summary",
+        "custom",
     ]
     .iter()
     .map(|kind| format!("{kind}={}", digest.counts.get(*kind).copied().unwrap_or(0)))
@@ -313,6 +376,9 @@ pub fn print_digest(digest: &SessionDigest, json: bool) -> Result<()> {
     .join("  ");
     writeln!(output, "records: {counts}")?;
     writeln!(output, "outcome: {}", describe_outcome(&digest.outcome))?;
+    if let Some(traffic) = &digest.msg {
+        writeln!(output, "msg: {}", describe_traffic(traffic))?;
+    }
 
     if !digest.opening.is_empty() {
         writeln!(output, "\nopening:")?;
@@ -492,6 +558,46 @@ fn describe_outcome(outcome: &Outcome) -> String {
         (None, Some(reason), None) => reason.to_owned(),
         (None, None, _) => "no assistant reply".to_owned(),
     }
+}
+
+/// `sent 2 to csv, db; got 3 from csv, user; csv ended`.
+fn describe_traffic(traffic: &MsgTraffic) -> String {
+    let name = |peer: &Peer| {
+        peer.name
+            .clone()
+            .unwrap_or_else(|| short_id(&peer.id, SHORT_ID).to_owned())
+    };
+    let sent_to = traffic
+        .peers
+        .iter()
+        .filter(|peer| peer.sent > 0)
+        .map(name)
+        .collect::<Vec<_>>();
+    let got_from = traffic
+        .peers
+        .iter()
+        .filter(|peer| peer.got > 0)
+        .map(name)
+        .chain((traffic.from_user > 0).then(|| "user".to_owned()))
+        .collect::<Vec<_>>();
+    let exits = traffic
+        .peers
+        .iter()
+        .filter_map(|peer| {
+            peer.exit
+                .as_ref()
+                .map(|exit| format!("{} {exit}", name(peer)))
+        })
+        .collect::<Vec<_>>();
+    [
+        (traffic.sent > 0).then(|| format!("sent {} to {}", traffic.sent, sent_to.join(", "))),
+        (traffic.got > 0).then(|| format!("got {} from {}", traffic.got, got_from.join(", "))),
+        (!exits.is_empty()).then(|| exits.join(", ")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join("; ")
 }
 
 fn human_count(count: u64) -> String {

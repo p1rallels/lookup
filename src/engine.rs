@@ -15,6 +15,10 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::{
     cli::{Kind, SortOrder},
+    custom::{
+        MSG, Msg, RELAY, Relay, compaction_relay, content_text, parse_msg, parse_relay,
+        reset_label, tool_messages,
+    },
     naming::{SHORT_ID, display_timestamp, iso_timestamp, short_id, unique_prefix_lengths},
     source::SessionFile,
 };
@@ -36,8 +40,32 @@ pub struct Record {
     /// A tool result pi marked as failed (`isError`).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub error: bool,
+    /// A custom record's customType: `msg`, `relay`, or another extension's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custom_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub msg: Option<Msg>,
+    /// Relay's details on its custom messages and on its reset compactions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay: Option<Relay>,
     pub text: String,
     pub path: String,
+}
+
+impl Record {
+    pub fn is_msg(&self) -> bool {
+        self.kind == Kind::Custom && self.custom_type.as_deref() == Some(MSG)
+    }
+}
+
+/// Catchup's default kinds. With [`conversation`], that's what the user
+/// typed, the assistant's answers, and msg traffic.
+pub const CONVERSATION: [Kind; 3] = [Kind::User, Kind::Assistant, Kind::Custom];
+
+/// Whether a record is conversation: custom records only when they're msg
+/// messages, so relay's nudges and other extensions' messages stay out.
+pub fn conversation(record: &Record) -> bool {
+    record.kind != Kind::Custom || record.is_msg()
 }
 
 #[derive(Debug)]
@@ -81,7 +109,12 @@ pub struct ActivityCounts {
     pub assistant_text_parts: usize,
     pub thinking_blocks: usize,
     pub tool_calls: usize,
+    pub custom_messages: usize,
+    /// Custom messages by customType.
+    pub custom_types: BTreeMap<String, usize>,
     pub compactions: usize,
+    /// Compactions relay wrote for its resets.
+    pub relay_resets: usize,
     pub model_changes: usize,
     pub thinking_level_changes: usize,
     pub session_events: usize,
@@ -99,6 +132,9 @@ pub struct CompactionTiming {
     pub previous_event: Option<String>,
     pub previous_stop_reason: Option<String>,
     pub preceding_event_gap_ms: Option<u64>,
+    /// Set when relay wrote it: which reset, at what context percent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay: Option<Relay>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -196,8 +232,32 @@ pub struct SessionDigest {
     pub latest_state: LatestState,
     pub files_changed: Vec<FileChange>,
     pub failed_tools: Failures,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub msg: Option<MsgTraffic>,
     pub final_message: Option<DigestEntry>,
     pub path: String,
+}
+
+/// The msg messages a session sent and got, by peer.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct MsgTraffic {
+    pub sent: usize,
+    pub got: usize,
+    /// Of those got, the ones a human sent (`/msg` or the msg cli).
+    pub from_user: usize,
+    pub peers: Vec<Peer>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct Peer {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub sent: usize,
+    pub got: usize,
+    /// `ended` or `died`, when its last such message said so.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -381,8 +441,18 @@ pub fn session_metrics(file: &SessionFile, compaction_limit: usize) -> Result<Se
                 count_message(&event, &mut counts);
                 note_assistant(&event, &mut usage, &mut models);
             }
+            "custom_message" => {
+                counts.custom_messages += 1;
+                let custom_type = event.get("customType").and_then(Value::as_str);
+                *counts
+                    .custom_types
+                    .entry(custom_type.unwrap_or("custom").to_owned())
+                    .or_insert(0) += 1;
+            }
             "compaction" => {
                 counts.compactions += 1;
+                let relay = compaction_relay(&event);
+                counts.relay_resets += usize::from(relay.is_some());
                 let preceding_event_gap_ms = previous
                     .as_ref()
                     .and_then(|event: &PreviousEvent| event.timestamp.as_deref())
@@ -400,6 +470,7 @@ pub fn session_metrics(file: &SessionFile, compaction_limit: usize) -> Result<Se
                         .as_ref()
                         .and_then(|event| event.stop_reason.clone()),
                     preceding_event_gap_ms,
+                    relay,
                 });
             }
             "model_change" => counts.model_changes += 1,
@@ -544,6 +615,7 @@ pub fn session_digest(
     let mut snapshots = Vec::new();
     let mut span: Option<(String, String)> = None;
     let mut changes = Changes::default();
+    let mut traffic = MsgTraffic::default();
 
     for (index, line) in map.split(|byte| *byte == b'\n').enumerate() {
         let Ok(event) = serde_json::from_slice::<Value>(line) else {
@@ -568,13 +640,27 @@ pub fn session_digest(
                 }
                 Kind::Summary => {
                     let state = summary_state(&record.text);
-                    if !state.goal.is_empty() {
-                        snapshots.push(DigestEntry {
-                            timestamp: record.timestamp,
-                            text: state.goal.clone(),
-                        });
+                    let milestone = match &record.relay {
+                        Some(relay) => Some(reset_milestone(relay, &state.goal)),
+                        None => Some(state.goal.clone()).filter(|goal| !goal.is_empty()),
+                    };
+                    snapshots.extend(milestone.map(|text| DigestEntry {
+                        timestamp: record.timestamp,
+                        text,
+                    }));
+                    let goal = record.relay.and_then(|relay| relay.goal);
+                    digest.latest_state = match (state.goal.is_empty(), goal) {
+                        (true, Some(goal)) => LatestState {
+                            goal: clipped_compact(&goal, 1_200),
+                            ..state
+                        },
+                        _ => state,
+                    };
+                }
+                Kind::Custom => {
+                    if let Some(msg) = &record.msg {
+                        note_msg(&mut traffic, msg, &file.session);
                     }
-                    digest.latest_state = state;
                 }
                 Kind::Assistant => {
                     digest.final_message = Some(DigestEntry {
@@ -591,6 +677,7 @@ pub fn session_digest(
     }
 
     digest.milestones = sampled_entries(snapshots, milestone_limit);
+    digest.msg = (traffic.sent + traffic.got > 0).then_some(traffic);
     digest.files_changed = changes.done.into_values().collect();
     digest.elapsed_ms = span.and_then(|(first, last)| duration_ms(&first, &last));
     Ok(digest)
@@ -613,20 +700,91 @@ fn empty_digest(file: &SessionFile) -> SessionDigest {
         latest_state: LatestState::default(),
         files_changed: Vec::new(),
         failed_tools: Failures::default(),
+        msg: None,
         final_message: None,
         path: file.path.to_string_lossy().into_owned(),
     }
 }
 
-/// Where the turn stood at the last message. Pi appends each message whole
-/// when it ends, so a prompt or a tool result means the model owed an
-/// answer, and an assistant message that called tools means they were
-/// running. Other roles and entries say nothing.
-fn note_turn(event: &Value, outcome: &mut Outcome) {
-    if event.get("type").and_then(Value::as_str) != Some("message") {
-        return;
+/// `relay reset #2 at 48%: <its note>`, else its goal.
+fn reset_milestone(relay: &Relay, summary_goal: &str) -> String {
+    let about = [
+        relay.note.as_deref(),
+        relay.goal.as_deref(),
+        Some(summary_goal),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|text| !text.trim().is_empty());
+    match about {
+        Some(text) => format!("{}: {}", reset_label(relay), clipped_compact(text, 600)),
+        None => reset_label(relay),
     }
-    let Some(message) = event.get("message") else {
+}
+
+/// Counts a msg message as sent when this session is its sender, else as
+/// got, from its peer or from a human.
+fn note_msg(traffic: &mut MsgTraffic, msg: &Msg, session: &str) {
+    let outgoing = msg.from.id.eq_ignore_ascii_case(session);
+    match (outgoing, msg.by_user, msg.to.as_deref()) {
+        (true, _, to) => {
+            traffic.sent = traffic.sent.saturating_add(1);
+            if let Some(to) = to {
+                let peer = peer(&mut traffic.peers, to);
+                peer.sent = peer.sent.saturating_add(1);
+            }
+        }
+        (false, true, _) => {
+            traffic.got = traffic.got.saturating_add(1);
+            traffic.from_user = traffic.from_user.saturating_add(1);
+        }
+        (false, false, _) => {
+            traffic.got = traffic.got.saturating_add(1);
+            let peer = peer(&mut traffic.peers, &msg.from.id);
+            peer.got = peer.got.saturating_add(1);
+            peer.name = msg.from.name.clone().or(peer.name.take());
+            peer.exit = msg.kind.clone().or(peer.exit.take());
+        }
+    }
+}
+
+fn peer<'a>(peers: &'a mut Vec<Peer>, id: &str) -> &'a mut Peer {
+    let index = match peers
+        .iter()
+        .position(|peer| peer.id.eq_ignore_ascii_case(id))
+    {
+        Some(index) => index,
+        None => {
+            peers.push(Peer {
+                id: id.to_owned(),
+                name: None,
+                sent: 0,
+                got: 0,
+                exit: None,
+            });
+            peers.len() - 1
+        }
+    };
+    &mut peers[index]
+}
+
+/// Where the turn stood at the last message. Pi appends each message whole
+/// when it ends, so a prompt, a tool result, or a msg or relay message (they
+/// wake the model or keep it going) means the model owed an answer, and an
+/// assistant message that called tools means they were running. Other roles
+/// and entries say nothing.
+fn note_turn(event: &Value, outcome: &mut Outcome) {
+    let message = match event.get("type").and_then(Value::as_str) {
+        Some("message") => event.get("message"),
+        Some("custom_message") => {
+            if let Some(MSG | RELAY) = event.get("customType").and_then(Value::as_str) {
+                outcome.open_turn = Some("thinking");
+            }
+            return;
+        }
+        _ => None,
+    };
+    let Some(message) = message else {
         return;
     };
     match message.get("role").and_then(Value::as_str) {
@@ -936,28 +1094,83 @@ fn records_from_event(event: &Value, file: &SessionFile, line_number: usize) -> 
     let timestamp = event
         .get("timestamp")
         .and_then(Value::as_str)
-        .unwrap_or(&file.started_at)
-        .to_owned();
+        .unwrap_or(&file.started_at);
+    let record =
+        |kind, text: &str| make_record(file, timestamp, line_number, (kind, None, false), text);
 
-    if event.get("type").and_then(Value::as_str) == Some("compaction") {
-        return event
+    match event.get("type").and_then(Value::as_str) {
+        Some("compaction") => event
             .get("summary")
             .and_then(Value::as_str)
-            .map(|text| {
-                vec![make_record(
-                    file,
-                    &timestamp,
-                    line_number,
-                    (Kind::Summary, None, false),
-                    text,
-                )]
+            .map(|summary| Record {
+                relay: compaction_relay(event),
+                ..record(Kind::Summary, summary)
             })
-            .unwrap_or_default();
+            .into_iter()
+            .collect(),
+        Some("custom_message") => vec![custom_record(event, record(Kind::Custom, ""))],
+        _ => event
+            .get("message")
+            .map(|message| {
+                let carried = match message.get("isError").and_then(Value::as_bool) {
+                    Some(true) => Vec::new(),
+                    _ => tool_messages(message),
+                };
+                message_records(message, file, timestamp, line_number)
+                    .into_iter()
+                    .chain(
+                        carried
+                            .into_iter()
+                            .map(|carried| msg_record(carried, "", record(Kind::Custom, ""))),
+                    )
+                    .collect()
+            })
+            .unwrap_or_default(),
     }
+}
 
-    let Some(message) = event.get("message") else {
-        return Vec::new();
-    };
+/// A custom message: msg's and relay's with their details, any other
+/// extension's with its type and text.
+fn custom_record(event: &Value, base: Record) -> Record {
+    let custom_type = event.get("customType").and_then(Value::as_str);
+    let content = content_text(event.get("content"));
+    match (custom_type, event.get("details")) {
+        (Some(MSG), Some(details)) => msg_record(details, &content, base),
+        (Some(RELAY), details) => Record {
+            custom_type: Some(RELAY.to_owned()),
+            relay: Some(details.map(parse_relay).unwrap_or_default()),
+            text: content,
+            ..base
+        },
+        _ => Record {
+            custom_type: custom_type.map(str::to_owned),
+            text: content,
+            ..base
+        },
+    }
+}
+
+/// A msg message, by its Message object: the text the sender wrote, not the
+/// framing the model read around it.
+fn msg_record(message: &Value, framed: &str, base: Record) -> Record {
+    Record {
+        custom_type: Some(MSG.to_owned()),
+        msg: parse_msg(message),
+        text: message
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or(framed)
+            .to_owned(),
+        ..base
+    }
+}
+
+fn message_records(
+    message: &Value,
+    file: &SessionFile,
+    timestamp: &str,
+    line_number: usize,
+) -> Vec<Record> {
     let role = message
         .get("role")
         .and_then(Value::as_str)
@@ -977,7 +1190,7 @@ fn records_from_event(event: &Value, file: &SessionFile, line_number: usize) -> 
         .filter_map(|part| normalize_part(part, role, tool_name.as_deref()))
         .map(|(kind, tool, text)| {
             let error = failed && kind == Kind::ToolResult;
-            make_record(file, &timestamp, line_number, (kind, tool, error), &text)
+            make_record(file, timestamp, line_number, (kind, tool, error), &text)
         })
         .collect()
 }
@@ -1034,6 +1247,9 @@ fn make_record(
         kind,
         tool,
         error,
+        custom_type: None,
+        msg: None,
+        relay: None,
         text: text.to_owned(),
         path: file.path.to_string_lossy().into_owned(),
     }
@@ -1130,8 +1346,9 @@ impl Matcher {
 #[cfg(test)]
 mod tests {
     use super::{
-        DigestEntry, Matcher, SearchOptions, compare_timestamp, normalize_part, sampled_entries,
-        search, select_session, session_digest, session_matches, session_metrics, summary_state,
+        CONVERSATION, DigestEntry, Matcher, SearchOptions, compare_timestamp, conversation,
+        normalize_part, sampled_entries, search, select_session, session_digest, session_matches,
+        session_metrics, session_records, summary_state,
     };
     use crate::{
         cli::{Kind, SortOrder},
@@ -1592,5 +1809,234 @@ mod tests {
         );
         assert!((usage.cost_usd - 0.75).abs() < 1e-9);
         assert_eq!(metrics.models, ["anthropic/opus", "gpt"]);
+    }
+
+    const MAIN: &str = "01a15300-0000-7000-8000-00000000000a";
+    const CSV: &str = "01a15301-0000-7000-8000-00000000000c";
+
+    /// A session from fixtures/tandem: an orchestrator (`main`) and its csv
+    /// child, written from the msg and relay contracts.
+    fn tandem(session: &str) -> SessionFile {
+        let folder = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/tandem"));
+        let path = fs::read_dir(&folder)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.to_string_lossy()
+                    .ends_with(&format!("_{session}.jsonl"))
+            })
+            .unwrap();
+        let started_at = path.file_name().unwrap().to_string_lossy()[..24].to_owned();
+        demo_file(path, session, &started_at)
+    }
+
+    #[test]
+    fn reads_custom_messages_and_msgs_in_msg_tool_results() {
+        let records = session_records(&tandem(MAIN), &[Kind::Custom]).unwrap();
+        let summary = records
+            .iter()
+            .map(|record| {
+                (
+                    record.line,
+                    record.custom_type.as_deref().unwrap_or(""),
+                    record.msg.as_ref().map(|msg| msg.from.id.as_str()),
+                    record.text.as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            summary,
+            [
+                (5, "msg", Some(CSV), "keep the header row in the output?"),
+                (7, "msg", Some(MAIN), "yes, keep the header row"),
+                (
+                    9,
+                    "msg",
+                    Some(CSV),
+                    "done: csv parser in src/csv.rs, 3 files, tests pass. kept the header row."
+                ),
+                (
+                    10,
+                    "msg",
+                    Some("01a15302-0000-7000-8000-00000000000d"),
+                    "db's process is gone without ending (pid 4242)"
+                ),
+                (
+                    11,
+                    "msg",
+                    Some("01a152ff-0000-7000-8000-0000000000ff"),
+                    "merge csv now, rerun db after"
+                ),
+                (
+                    12,
+                    "relay",
+                    None,
+                    "45% of context used: finish the step, commit, then call relay with a note for whoever picks this up."
+                ),
+                (15, "relay", None, "Context reset #1 at 48%."),
+                (18, "handoff", None, "another extension's note"),
+            ]
+        );
+        assert_eq!(
+            records[2].msg.as_ref().unwrap().kind.as_deref(),
+            Some("ended")
+        );
+        assert!(records[4].msg.as_ref().unwrap().by_user);
+        assert_eq!(records[6].relay.as_ref().unwrap().n, Some(1));
+        let users = session_records(&tandem(MAIN), &[Kind::User]).unwrap();
+        assert_eq!(users.len(), 1);
+
+        let child = session_records(&tandem(CSV), &[Kind::Custom]).unwrap();
+        assert_eq!(
+            child
+                .iter()
+                .map(|record| (record.line, record.msg.as_ref().unwrap().from.id.as_str()))
+                .collect::<Vec<_>>(),
+            [(4, CSV), (4, MAIN)]
+        );
+    }
+
+    #[test]
+    fn failed_msg_tools_carry_no_messages() {
+        let sent = json!({"v": 1, "id": "m1", "ts": 1, "from": {"id": "me"}, "to": "you",
+            "text": "hi", "delivery": "steer"});
+        let path = write_events(
+            "msg-error",
+            &[json!({
+                "type": "message",
+                "timestamp": "2026-01-01T00:00:01Z",
+                "message": {"role": "toolResult", "toolName": "msg_send", "isError": true,
+                    "content": [{"type": "text", "text": "no such session"}],
+                    "details": {"message": sent}}
+            })],
+        );
+        let file = demo_file(path.clone(), "msg-error-test", "2026-01-01T00-00-00Z");
+        let records = session_records(&file, &[Kind::Custom, Kind::ToolResult]).unwrap();
+        fs::remove_file(path).unwrap();
+        assert_eq!(
+            records.iter().map(|record| record.kind).collect::<Vec<_>>(),
+            [Kind::ToolResult]
+        );
+    }
+
+    #[test]
+    fn conversation_keeps_msg_traffic_and_leaves_relay_out() {
+        let lines = session_records(&tandem(MAIN), &CONVERSATION)
+            .unwrap()
+            .into_iter()
+            .filter(conversation)
+            .map(|record| (record.line, record.kind))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            lines,
+            [
+                (2, Kind::User),
+                (3, Kind::Assistant),
+                (5, Kind::Custom),
+                (7, Kind::Custom),
+                (9, Kind::Custom),
+                (10, Kind::Custom),
+                (11, Kind::Custom),
+                (13, Kind::Assistant),
+                (17, Kind::Assistant),
+            ]
+        );
+    }
+
+    #[test]
+    fn digests_msg_traffic_and_relay_resets() {
+        let digest = session_digest(&tandem(MAIN), 3, 8).unwrap();
+        let traffic = digest.msg.unwrap();
+        assert_eq!((traffic.sent, traffic.got, traffic.from_user), (1, 4, 1));
+        assert_eq!(
+            traffic
+                .peers
+                .iter()
+                .map(|peer| (
+                    peer.name.as_deref(),
+                    peer.sent,
+                    peer.got,
+                    peer.exit.as_deref()
+                ))
+                .collect::<Vec<_>>(),
+            [
+                (Some("csv"), 1, 2, Some("ended")),
+                (Some("db"), 0, 1, Some("died"))
+            ]
+        );
+        assert_eq!(
+            digest
+                .milestones
+                .iter()
+                .map(|entry| entry.text.as_str())
+                .collect::<Vec<_>>(),
+            ["relay reset #1 at 48%: csv merged; db died, rerun it in fork 2"]
+        );
+        assert_eq!(
+            digest.latest_state.goal,
+            "fan out csv and db, merge what lands"
+        );
+        assert_eq!(digest.counts.get("custom"), Some(&8));
+        assert_eq!(digest.counts.get("user"), Some(&1));
+        assert_eq!(digest.outcome.open_turn, None);
+
+        let child = session_digest(&tandem(CSV), 3, 8).unwrap().msg.unwrap();
+        assert_eq!((child.sent, child.got), (1, 1));
+        assert_eq!(child.peers[0].name.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn a_trailing_msg_leaves_the_turn_open() {
+        let path = write_events(
+            "msg-open",
+            &[
+                json!({
+                    "type": "message",
+                    "timestamp": "2026-01-01T00:00:01Z",
+                    "message": {"role": "assistant", "stopReason": "stop",
+                        "content": [{"type": "text", "text": "waiting on csv"}]}
+                }),
+                json!({
+                    "type": "custom_message",
+                    "timestamp": "2026-01-01T00:00:02Z",
+                    "customType": "msg",
+                    "content": "framed",
+                    "details": {"from": {"id": "csv-id", "name": "csv"}, "to": "open-test",
+                        "text": "done", "kind": "ended"}
+                }),
+                json!({
+                    "type": "custom_message",
+                    "timestamp": "2026-01-01T00:00:03Z",
+                    "customType": "other",
+                    "content": "ignored"
+                }),
+            ],
+        );
+        let file = demo_file(path.clone(), "open-test", "2026-01-01T00-00-00Z");
+        let digest = session_digest(&file, 3, 8).unwrap();
+        fs::remove_file(path).unwrap();
+        assert_eq!(digest.outcome.open_turn, Some("thinking"));
+    }
+
+    #[test]
+    fn stats_count_custom_messages_and_relay_resets() {
+        let metrics = session_metrics(&tandem(MAIN), 20).unwrap();
+        let counts = &metrics.counts;
+        assert_eq!(counts.custom_messages, 6);
+        assert_eq!(
+            counts
+                .custom_types
+                .iter()
+                .map(|(custom_type, count)| (custom_type.as_str(), *count))
+                .collect::<Vec<_>>(),
+            [("handoff", 1), ("msg", 3), ("relay", 2)]
+        );
+        assert_eq!((counts.compactions, counts.relay_resets), (1, 1));
+        assert_eq!(counts.other_events, 0);
+        let relay = metrics.compactions[0].relay.as_ref().unwrap();
+        assert_eq!(
+            (relay.n, relay.percent.as_ref().and_then(|p| p.as_u64())),
+            (Some(1), Some(48))
+        );
     }
 }
