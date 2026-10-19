@@ -719,7 +719,83 @@ fn excerpt_without_match(text: &str, width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{excerpt, human_bytes, human_duration, truncate_text};
+    use super::{
+        describe_traffic, excerpt, human_bytes, human_duration, record_label, truncate_text,
+    };
+    use crate::{
+        cli::Kind,
+        custom::parse_relay,
+        engine::{MsgTraffic, Peer, Record},
+        naming::Names,
+    };
+    use serde_json::json;
+
+    fn record(kind: Kind) -> Record {
+        Record {
+            project: "demo".to_owned(),
+            cwd: "/tmp/demo".to_owned(),
+            session: "01a15300-0000".to_owned(),
+            started_at: "2026-01-01T00-00-00Z".to_owned(),
+            timestamp: "2026-01-01T00:00:01Z".to_owned(),
+            line: 1,
+            kind,
+            tool: None,
+            error: false,
+            custom_type: None,
+            msg: None,
+            relay: None,
+            text: String::new(),
+            path: "/tmp/demo/s.jsonl".to_owned(),
+        }
+    }
+
+    #[test]
+    fn labels_relay_resets_and_untyped_custom_records() {
+        let names = Names::default();
+        let relay = Some(parse_relay(&json!({"n": 3, "percent": 51.2})));
+        let reset = Record {
+            relay: relay.clone(),
+            ..record(Kind::Summary)
+        };
+        assert_eq!(record_label(&reset, &names), "relay reset #3 at 51%");
+        assert_eq!(record_label(&record(Kind::Summary), &names), "summary");
+        assert_eq!(record_label(&record(Kind::Custom), &names), "custom");
+        let typed = Record {
+            custom_type: Some("handoff".to_owned()),
+            ..record(Kind::Custom)
+        };
+        assert_eq!(record_label(&typed, &names), "handoff");
+    }
+
+    #[test]
+    fn describes_msg_traffic_in_one_line() {
+        let peer = |id: &str, name: Option<&str>, sent, got, exit: Option<&str>| Peer {
+            id: id.to_owned(),
+            name: name.map(str::to_owned),
+            sent,
+            got,
+            exit: exit.map(str::to_owned),
+        };
+        let traffic = MsgTraffic {
+            sent: 3,
+            got: 4,
+            from_user: 1,
+            peers: vec![
+                peer("01a15301-0000", Some("csv"), 2, 2, Some("ended")),
+                peer("01a15302-0000", None, 1, 1, None),
+            ],
+        };
+        assert_eq!(
+            describe_traffic(&traffic),
+            "sent 3 to csv, 01a15302; got 4 from csv, 01a15302, user; csv ended"
+        );
+        let quiet = MsgTraffic {
+            sent: 1,
+            peers: vec![peer("01a15300-0000", Some("main"), 1, 0, None)],
+            ..MsgTraffic::default()
+        };
+        assert_eq!(describe_traffic(&quiet), "sent 1 to main");
+    }
 
     #[test]
     fn excerpt_preserves_utf8_boundaries() {
