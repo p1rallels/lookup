@@ -9,10 +9,15 @@ use serde::Serialize;
 
 use crate::{
     cli::Kind,
-    engine::{Record, SessionDigest, SessionMetrics, compact, short_id},
+    engine::{Failures, Outcome, Record, SessionDigest, SessionMetrics, Usage, compact},
+    naming::{Names, display_timestamp},
 };
 
+const FINAL_MESSAGE_BYTES: usize = 4000;
+const FILES_SHOWN: usize = 20;
+
 pub struct DisplayOptions<'a> {
+    pub names: &'a Names,
     pub query: Option<&'a str>,
     pub regex: bool,
     pub case_sensitive: bool,
@@ -34,6 +39,8 @@ struct JsonRecord<'a> {
     kind: Kind,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool: Option<&'a str>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    error: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     text: Option<&'a str>,
     text_bytes: usize,
@@ -47,6 +54,7 @@ pub struct SessionRow<'a> {
     pub cwd: &'a str,
     pub session: &'a str,
     pub started_at: &'a str,
+    pub started_at_iso: Option<String>,
     pub bytes: u64,
     pub title: &'a str,
     pub path: String,
@@ -80,10 +88,14 @@ pub fn print_records(records: &[Record], options: &DisplayOptions<'_>) -> Result
             .as_deref()
             .map(|name| format!(" {name}"))
             .unwrap_or_default();
+        let error = match record.error {
+            true => " [error]",
+            false => "",
+        };
         let header = format!(
-            "{timestamp}  {}  {}:{}  {}{tool}",
-            record.project,
-            short_id(&record.session),
+            "{timestamp}  {}  {}:{}  {}{tool}{error}",
+            options.names.label(&record.cwd, &record.project),
+            options.names.id(&record.session),
             record.line,
             record.kind.label(),
         );
@@ -122,6 +134,7 @@ fn json_record<'a>(record: &'a Record, options: &DisplayOptions<'_>) -> JsonReco
         line: record.line,
         kind: record.kind,
         tool: record.tool.as_deref(),
+        error: record.error,
         text,
         text_bytes: record.text.len(),
         text_truncated: text.is_none_or(|text| text.len() < record.text.len()),
@@ -143,9 +156,14 @@ fn truncate_text(text: &str, maximum: Option<usize>) -> &str {
     &text[..end]
 }
 
-pub fn print_sessions(rows: &[SessionRow<'_>], json: bool) -> Result<()> {
+pub fn print_sessions(rows: &[SessionRow<'_>], json: bool, names: &Names) -> Result<()> {
     let stdout = io::stdout();
     let mut output = io::BufWriter::new(stdout.lock());
+    let id_width = rows
+        .iter()
+        .map(|row| names.id(row.session).len())
+        .max()
+        .unwrap_or_default();
     for row in rows {
         if json {
             serde_json::to_writer(&mut output, row)?;
@@ -153,11 +171,11 @@ pub fn print_sessions(rows: &[SessionRow<'_>], json: bool) -> Result<()> {
         } else {
             writeln!(
                 output,
-                "{}  {}  {:>9}  {}  {}",
+                "{}  {:<id_width$}  {:>9}  {}  {}",
                 display_timestamp(row.started_at),
-                short_id(row.session),
+                names.id(row.session),
                 human_bytes(row.bytes),
-                row.project,
+                names.label(row.cwd, row.project),
                 excerpt_without_match(row.title, 100),
             )?;
         }
@@ -216,6 +234,10 @@ pub fn print_metrics(metrics: &SessionMetrics, json: bool) -> Result<()> {
         "lifecycle: {} session starts  {} model changes  {} thinking-level changes",
         counts.session_events, counts.model_changes, counts.thinking_level_changes,
     )?;
+    writeln!(output, "usage: {}", describe_usage(&metrics.usage))?;
+    if !metrics.models.is_empty() {
+        writeln!(output, "models: {}", metrics.models.join(", "))?;
+    }
     writeln!(
         output,
         "compactions: {} total, {} listed",
@@ -266,9 +288,13 @@ pub fn print_digest(digest: &SessionDigest, json: bool) -> Result<()> {
 
     writeln!(output, "session: {}", digest.session)?;
     writeln!(output, "project: {} ({})", digest.project, digest.cwd)?;
+    let elapsed = digest
+        .elapsed_ms
+        .map(|milliseconds| format!("  elapsed: {}", human_duration(milliseconds)))
+        .unwrap_or_default();
     writeln!(
         output,
-        "range: {} → {}  size: {}",
+        "range: {} → {}{elapsed}  size: {}",
         display_timestamp(&digest.started_at),
         display_timestamp(&digest.ended_at),
         human_bytes(digest.bytes)
@@ -286,6 +312,7 @@ pub fn print_digest(digest: &SessionDigest, json: bool) -> Result<()> {
     .collect::<Vec<_>>()
     .join("  ");
     writeln!(output, "records: {counts}")?;
+    writeln!(output, "outcome: {}", describe_outcome(&digest.outcome))?;
 
     if !digest.opening.is_empty() {
         writeln!(output, "\nopening:")?;
@@ -332,10 +359,83 @@ pub fn print_digest(digest: &SessionDigest, json: bool) -> Result<()> {
             }
         }
     }
+    print_changes(&mut output, digest)?;
+    print_failures(&mut output, &digest.failed_tools)?;
+    print_final_message(&mut output, digest)?;
     Ok(())
 }
 
-pub fn print_projects(rows: &[ProjectRow<'_>], json: bool) -> Result<()> {
+fn print_changes(output: &mut impl Write, digest: &SessionDigest) -> io::Result<()> {
+    if digest.files_changed.is_empty() {
+        return Ok(());
+    }
+    writeln!(output, "\nfiles changed: {}", digest.files_changed.len())?;
+    let inside = format!("{}/", digest.cwd.trim_end_matches('/'));
+    for change in digest.files_changed.iter().take(FILES_SHOWN) {
+        let path = change.path.strip_prefix(&inside).unwrap_or(&change.path);
+        let counts = [(change.writes, "write"), (change.edits, "edit")]
+            .iter()
+            .filter(|(count, _)| *count > 0)
+            .map(|(count, label)| format!("{label} ×{count}"))
+            .collect::<Vec<_>>()
+            .join("  ");
+        writeln!(output, "  {path}  {counts}")?;
+    }
+    let hidden = digest.files_changed.len().saturating_sub(FILES_SHOWN);
+    if hidden > 0 {
+        writeln!(output, "  … and {hidden} more")?;
+    }
+    Ok(())
+}
+
+fn print_failures(output: &mut impl Write, failures: &Failures) -> io::Result<()> {
+    if failures.count == 0 {
+        return Ok(());
+    }
+    let shown = match failures.count > failures.recent.len() {
+        true => format!(" (last {})", failures.recent.len()),
+        false => String::new(),
+    };
+    writeln!(output, "\nfailed tool calls: {}{shown}", failures.count)?;
+    for failure in &failures.recent {
+        writeln!(
+            output,
+            "  {}  {}  {}",
+            display_timestamp(&failure.timestamp),
+            failure.tool.as_deref().unwrap_or("tool"),
+            failure.text,
+        )?;
+    }
+    Ok(())
+}
+
+fn print_final_message(output: &mut impl Write, digest: &SessionDigest) -> io::Result<()> {
+    let Some(entry) = &digest.final_message else {
+        return Ok(());
+    };
+    writeln!(
+        output,
+        "\nfinal message ({}):",
+        display_timestamp(&entry.timestamp)
+    )?;
+    let text = entry.text.trim();
+    let shown = truncate_text(text, Some(FINAL_MESSAGE_BYTES));
+    for line in shown.lines() {
+        writeln!(output, "  {line}")?;
+    }
+    let rest = text.len().saturating_sub(shown.len());
+    if rest > 0 {
+        writeln!(
+            output,
+            "  … {} more: lookup last {} -k assistant --full",
+            human_bytes(rest as u64),
+            digest.session,
+        )?;
+    }
+    Ok(())
+}
+
+pub fn print_projects(rows: &[ProjectRow<'_>], json: bool, names: &Names) -> Result<()> {
     let stdout = io::stdout();
     let mut output = io::BufWriter::new(stdout.lock());
     for row in rows {
@@ -348,12 +448,65 @@ pub fn print_projects(rows: &[ProjectRow<'_>], json: bool) -> Result<()> {
                 "{:>5}  {:>9}  {:<28}  {}",
                 row.sessions,
                 human_bytes(row.bytes),
-                row.name,
+                names.label(row.cwd, row.name),
                 row.cwd,
             )?;
         }
     }
     Ok(())
+}
+
+fn describe_usage(usage: &Usage) -> String {
+    if usage.total_tokens == 0 && usage.cost_usd == 0.0 {
+        return "not recorded".to_owned();
+    }
+    format!(
+        "{}  {} tokens  ({} input  {} output  {} cache read  {} cache write)",
+        human_cost(usage.cost_usd),
+        human_count(usage.total_tokens),
+        human_count(usage.input),
+        human_count(usage.output),
+        human_count(usage.cache_read),
+        human_count(usage.cache_write),
+    )
+}
+
+fn describe_outcome(outcome: &Outcome) -> String {
+    match (
+        outcome.open_turn,
+        outcome.stop_reason.as_deref(),
+        outcome.error_message.as_deref(),
+    ) {
+        (Some("running-tools"), _, _) => {
+            "mid-turn, tools were running (still going, or it stopped there)".to_owned()
+        }
+        (Some(_), _, _) => {
+            "mid-turn, the model hadn't answered (still going, or it stopped there)".to_owned()
+        }
+        (None, Some(reason), Some(message)) => {
+            format!(
+                "{reason}: {}",
+                excerpt_without_match(&compact(message), 300)
+            )
+        }
+        (None, Some(reason), None) => reason.to_owned(),
+        (None, None, _) => "no assistant reply".to_owned(),
+    }
+}
+
+fn human_count(count: u64) -> String {
+    match count {
+        0..1_000 => count.to_string(),
+        1_000..1_000_000 => format!("{:.1}k", count as f64 / 1e3),
+        _ => format!("{:.1}M", count as f64 / 1e6),
+    }
+}
+
+fn human_cost(dollars: f64) -> String {
+    match dollars < 1.0 {
+        true => format!("${dollars:.3}"),
+        false => format!("${dollars:.2}"),
+    }
 }
 
 fn human_duration(milliseconds: u64) -> String {
@@ -456,10 +609,6 @@ fn excerpt_without_match(text: &str, width: usize) -> String {
         end -= 1;
     }
     format!("{}…", &text[..end])
-}
-
-fn display_timestamp(timestamp: &str) -> String {
-    timestamp.get(..19).unwrap_or(timestamp).replace('T', " ")
 }
 
 #[cfg(test)]

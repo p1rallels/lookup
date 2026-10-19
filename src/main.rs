@@ -1,29 +1,41 @@
 mod cli;
 mod engine;
+mod naming;
 mod output;
 mod source;
 
-use std::{io, path::Path, process::ExitCode};
+use std::{collections::HashMap, io, path::PathBuf, process::ExitCode};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
-use rayon::prelude::*;
 
-use cli::{Cli, Command, selected_kinds};
-use engine::{
-    SearchOptions, search, select_session, session_digest, session_matches, session_metrics,
-    session_records, session_title,
+use cli::{
+    CatchupArgs, Cli, Command, Kind, LastArgs, ProjectsArgs, SearchArgs, SessionsArgs, ShowArgs,
+    StatsArgs, SummarizeArgs, selected_kinds,
 };
+use engine::{
+    Record, SearchOptions, search, select_session, session_digest, session_matches,
+    session_metrics, session_records, session_title, validate_bound, within_bounds,
+};
+use naming::{Names, iso_timestamp};
 use output::{
     DisplayOptions, ProjectRow, SessionRow, human_bytes, print_digest, print_metrics,
     print_projects, print_records, print_sessions,
 };
 use source::{
-    SessionFile, active_session_path, current_session_file, current_session_id, discover_projects,
-    global_session_files, project_stats, select_projects, session_files, sessions_root,
+    SessionFile, active_session_path, catalog, current_session_file, current_session_id,
+    global_session_files, listed_projects, scope_files, session_files, sessions_roots,
 };
 
 const DEFAULT_JSON_TEXT_BYTES: usize = 4096;
+
+/// Where a command looks: the session roots and the `-p`/`--all-projects`
+/// selection.
+struct Scope<'a> {
+    roots: &'a [PathBuf],
+    selectors: &'a [String],
+    all_projects: bool,
+}
 
 fn main() -> ExitCode {
     match run() {
@@ -38,235 +50,317 @@ fn main() -> ExitCode {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
-    let root = sessions_root(cli.root)?;
-
+    let roots = sessions_roots(cli.root)?;
+    let scope = Scope {
+        roots: &roots,
+        selectors: &cli.project,
+        all_projects: cli.all_projects,
+    };
     match cli.command {
-        Command::Search(args) => {
-            let mut files = scoped_files(
-                &root,
-                &cli.project,
-                cli.all_projects,
-                args.session.as_deref(),
-            )?;
-            if let Some(selector) = args.session.as_deref() {
-                files = vec![select_session(&files, selector)?.clone()];
+        Command::Search(args) => search_command(&scope, &args),
+        Command::Catchup(args) => catchup_command(&scope, &args),
+        Command::Stats(args) => stats_command(&scope, &args),
+        Command::Last(args) => last_command(&scope, &args),
+        Command::Show(args) => show_command(&scope, &args),
+        Command::Summarize(args) => summarize_command(&scope, &args),
+        Command::Sessions(args) => sessions_command(&scope, &args),
+        Command::Projects(args) => projects_command(&scope, &args),
+    }
+}
+
+fn search_command(scope: &Scope<'_>, args: &SearchArgs) -> Result<()> {
+    let mut files = scoped_files(scope, args.session.as_deref())?;
+    if let Some(selector) = args.session.as_deref() {
+        files = vec![select_session(&files, selector)?.clone()];
+    }
+    files.retain(|file| {
+        !args
+            .exclude_session
+            .iter()
+            .any(|selector| session_matches(file, selector))
+    });
+    if args.exclude_active {
+        exclude_active(scope.roots, &mut files)?;
+    }
+    let kinds = search_kinds(args)?;
+    let output = search(
+        &files,
+        &SearchOptions {
+            kinds: &kinds,
+            query: &args.query,
+            regex: args.regex,
+            case_sensitive: args.case_sensitive,
+            tool: args.tool.as_deref(),
+            errors_only: args.errors,
+            since: args.since.as_deref(),
+            until: args.until.as_deref(),
+            sort: args.sort,
+            around: args.around,
+            limit: args.limit,
+        },
+    )?;
+    let names = display_names(
+        scope.roots,
+        output.records.iter().map(|record| record.cwd.clone()),
+        args.json,
+    );
+    print_records(
+        &output.records,
+        &DisplayOptions {
+            names: &names,
+            query: Some(&args.query),
+            regex: args.regex,
+            case_sensitive: args.case_sensitive,
+            context: args.context,
+            full: args.full,
+            json: args.json,
+            max_text: json_text_limit(args.json, args.full, args.max_text),
+            metadata_only: args.metadata_only,
+        },
+    )?;
+    if args.stats {
+        eprintln!(
+            "scanned {} files ({}) in {:.3}s; {} candidate lines, {} parsed, {} matches, {} output records",
+            output.stats.files,
+            human_bytes(output.stats.bytes),
+            output.stats.elapsed.as_secs_f64(),
+            output.stats.candidate_lines,
+            output.stats.parsed_lines,
+            output.match_count,
+            output.records.len(),
+        );
+    }
+    Ok(())
+}
+
+fn catchup_command(scope: &Scope<'_>, args: &CatchupArgs) -> Result<()> {
+    let file = target_session_file(scope, args.session.as_deref(), "catchup")?;
+    let records = last_records(
+        session_records(&file, &[Kind::User, Kind::Assistant])?,
+        args.limit,
+    );
+    let names = display_names(scope.roots, [file.cwd.clone()], args.json);
+    print_records(
+        &records,
+        &timeline_display(
+            &names,
+            args.context,
+            args.full,
+            args.json,
+            args.max_text,
+            args.metadata_only,
+        ),
+    )
+}
+
+fn stats_command(scope: &Scope<'_>, args: &StatsArgs) -> Result<()> {
+    let file = target_session_file(scope, args.session.as_deref(), "stats")?;
+    print_metrics(&session_metrics(&file, args.limit)?, args.json)
+}
+
+fn last_command(scope: &Scope<'_>, args: &LastArgs) -> Result<()> {
+    let files = scoped_files(scope, Some(&args.session))?;
+    let file = select_session(&files, &args.session)?;
+    let kinds = match args.kind.is_empty() {
+        true => Kind::ALL.to_vec(),
+        false => args.kind.clone(),
+    };
+    let records = last_records(session_records(file, &kinds)?, args.limit);
+    let names = display_names(scope.roots, [file.cwd.clone()], args.json);
+    print_records(
+        &records,
+        &timeline_display(
+            &names,
+            args.context,
+            args.full,
+            args.json,
+            args.max_text,
+            args.metadata_only,
+        ),
+    )
+}
+
+fn show_command(scope: &Scope<'_>, args: &ShowArgs) -> Result<()> {
+    let files = scoped_files(scope, Some(&args.session))?;
+    let file = select_session(&files, &args.session)?;
+    let kinds = selected_kinds(&args.kind, args.all_kinds);
+    let records = last_records(session_records(file, &kinds)?, args.limit);
+    let names = display_names(scope.roots, [file.cwd.clone()], args.json);
+    print_records(
+        &records,
+        &timeline_display(
+            &names,
+            args.context,
+            args.full,
+            args.json,
+            args.max_text,
+            args.metadata_only,
+        ),
+    )
+}
+
+fn summarize_command(scope: &Scope<'_>, args: &SummarizeArgs) -> Result<()> {
+    let files = scoped_files(scope, Some(&args.session))?;
+    let file = select_session(&files, &args.session)?;
+    print_digest(
+        &session_digest(file, args.opening, args.milestones)?,
+        args.json,
+    )
+}
+
+fn sessions_command(scope: &Scope<'_>, args: &SessionsArgs) -> Result<()> {
+    let (since, until) = (args.since.as_deref(), args.until.as_deref());
+    validate_bound(since)?;
+    validate_bound(until)?;
+    let filter = args.filter.as_deref().map(str::to_lowercase);
+    let in_range = |started: Option<&str>| {
+        (since.is_none() && until.is_none())
+            || started.is_some_and(|started| within_bounds(started, since, until))
+    };
+    let matches = |file: &SessionFile, title: &str| {
+        filter.as_ref().is_none_or(|filter| {
+            format!(
+                "{} {} {} {} {}",
+                file.project, file.cwd, file.session, file.started_at, title
+            )
+            .to_lowercase()
+            .contains(filter)
+        })
+    };
+    let listed = scope_files(scope.roots, scope.selectors, scope.all_projects)?
+        .into_iter()
+        .map(|file| (iso_timestamp(&file.started_at), file))
+        .filter(|(started, _)| in_range(started.as_deref()))
+        .map(|(started, file)| session_title(&file).map(|title| (file, title, started)))
+        .filter(|listed| {
+            listed
+                .as_ref()
+                .map_or(true, |(file, title, _)| matches(file, title))
+        })
+        .take(match args.limit {
+            0 => usize::MAX,
+            limit => limit,
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let names = display_names(
+        scope.roots,
+        listed.iter().map(|(file, _, _)| file.cwd.clone()),
+        args.json,
+    );
+    let rows = listed
+        .iter()
+        .map(|(file, title, started)| SessionRow {
+            project: &file.project,
+            cwd: &file.cwd,
+            session: &file.session,
+            started_at: &file.started_at,
+            started_at_iso: started.clone(),
+            bytes: file.bytes,
+            title,
+            path: file.path.to_string_lossy().into_owned(),
+        })
+        .collect::<Vec<_>>();
+    print_sessions(&rows, args.json, &names)
+}
+
+fn projects_command(scope: &Scope<'_>, args: &ProjectsArgs) -> Result<()> {
+    let selectors = scope
+        .selectors
+        .iter()
+        .chain(args.filter.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut projects = listed_projects(scope.roots, &selectors)?;
+    let totals = session_files(&projects)?.into_iter().fold(
+        HashMap::<String, (usize, u64)>::new(),
+        |mut totals, file| {
+            let (sessions, bytes) = totals.entry(file.cwd).or_default();
+            *sessions = sessions.saturating_add(1);
+            *bytes = bytes.saturating_add(file.bytes);
+            totals
+        },
+    );
+    projects.dedup_by(|later, earlier| later.cwd == earlier.cwd);
+    let names = display_names(scope.roots, [], args.json);
+    let rows = projects
+        .iter()
+        .map(|project| {
+            let (sessions, bytes) = totals.get(&project.cwd).copied().unwrap_or_default();
+            ProjectRow {
+                name: &project.name,
+                cwd: &project.cwd,
+                sessions,
+                bytes,
             }
-            files.retain(|file| {
-                !args
-                    .exclude_session
-                    .iter()
-                    .any(|selector| session_matches(file, selector))
-            });
-            if args.exclude_active
-                && let Some(active) = active_session_path(&root)?
-            {
+        })
+        .collect::<Vec<_>>();
+    print_projects(&rows, args.json, &names)
+}
+
+fn search_kinds(args: &SearchArgs) -> Result<Vec<Kind>> {
+    let kinds = match (args.errors, args.kind.is_empty() && !args.all_kinds) {
+        (true, true) => vec![Kind::ToolResult],
+        _ => selected_kinds(&args.kind, args.all_kinds),
+    };
+    if args.errors && !kinds.contains(&Kind::ToolResult) {
+        bail!("--errors only matches tool results; add tool-result to --kind");
+    }
+    Ok(kinds)
+}
+
+/// The running Pi session when pi says which one it is, else the current
+/// folder's most recently written session.
+fn exclude_active(roots: &[PathBuf], files: &mut Vec<SessionFile>) -> Result<()> {
+    match current_session_id() {
+        Some(id) => files.retain(|file| !file.session.eq_ignore_ascii_case(&id)),
+        None => {
+            if let Some(active) = active_session_path(roots)? {
                 files.retain(|file| file.path != active);
             }
-            let kinds = selected_kinds(&args.kind, args.all_kinds);
-            let output = search(
-                &files,
-                &SearchOptions {
-                    kinds: &kinds,
-                    query: &args.query,
-                    regex: args.regex,
-                    case_sensitive: args.case_sensitive,
-                    tool: args.tool.as_deref(),
-                    since: args.since.as_deref(),
-                    until: args.until.as_deref(),
-                    sort: args.sort,
-                    around: args.around,
-                    limit: args.limit,
-                },
-            )?;
-            print_records(
-                &output.records,
-                &DisplayOptions {
-                    query: Some(&args.query),
-                    regex: args.regex,
-                    case_sensitive: args.case_sensitive,
-                    context: args.context,
-                    full: args.full,
-                    json: args.json,
-                    max_text: json_text_limit(args.json, args.full, args.max_text),
-                    metadata_only: args.metadata_only,
-                },
-            )?;
-            if args.stats {
-                eprintln!(
-                    "scanned {} files ({}) in {:.3}s; {} candidate lines, {} parsed, {} matches, {} output records",
-                    output.stats.files,
-                    human_bytes(output.stats.bytes),
-                    output.stats.elapsed.as_secs_f64(),
-                    output.stats.candidate_lines,
-                    output.stats.parsed_lines,
-                    output.match_count,
-                    output.records.len(),
-                );
-            }
-        }
-        Command::Catchup(args) => {
-            let file = target_session_file(
-                &root,
-                &cli.project,
-                cli.all_projects,
-                args.session.as_deref(),
-                "catchup",
-            )?;
-            let mut records = session_records(&file, &[cli::Kind::User, cli::Kind::Assistant])?;
-            if args.limit > 0 && records.len() > args.limit {
-                records.drain(..records.len() - args.limit);
-            }
-            print_records(
-                &records,
-                &DisplayOptions {
-                    query: None,
-                    regex: false,
-                    case_sensitive: false,
-                    context: args.context,
-                    full: args.full,
-                    json: args.json,
-                    max_text: json_text_limit(args.json, args.full, args.max_text),
-                    metadata_only: args.metadata_only,
-                },
-            )?;
-        }
-        Command::Stats(args) => {
-            let file = target_session_file(
-                &root,
-                &cli.project,
-                cli.all_projects,
-                args.session.as_deref(),
-                "stats",
-            )?;
-            let metrics = session_metrics(&file, args.limit)?;
-            print_metrics(&metrics, args.json)?;
-        }
-        Command::Last(args) => {
-            let files = scoped_files(&root, &cli.project, cli.all_projects, Some(&args.session))?;
-            let file = select_session(&files, &args.session)?;
-            let kinds = if args.kind.is_empty() {
-                cli::Kind::ALL.to_vec()
-            } else {
-                args.kind.clone()
-            };
-            let mut records = session_records(file, &kinds)?;
-            if args.limit > 0 && records.len() > args.limit {
-                records.drain(..records.len() - args.limit);
-            }
-            print_records(
-                &records,
-                &DisplayOptions {
-                    query: None,
-                    regex: false,
-                    case_sensitive: false,
-                    context: args.context,
-                    full: args.full,
-                    json: args.json,
-                    max_text: json_text_limit(args.json, args.full, args.max_text),
-                    metadata_only: args.metadata_only,
-                },
-            )?;
-        }
-        Command::Show(args) => {
-            let files = scoped_files(&root, &cli.project, cli.all_projects, Some(&args.session))?;
-            let file = select_session(&files, &args.session)?;
-            let kinds = selected_kinds(&args.kind, args.all_kinds);
-            let mut records = session_records(file, &kinds)?;
-            if args.limit > 0 && records.len() > args.limit {
-                records.drain(..records.len() - args.limit);
-            }
-            print_records(
-                &records,
-                &DisplayOptions {
-                    query: None,
-                    regex: false,
-                    case_sensitive: false,
-                    context: args.context,
-                    full: args.full,
-                    json: args.json,
-                    max_text: json_text_limit(args.json, args.full, args.max_text),
-                    metadata_only: args.metadata_only,
-                },
-            )?;
-        }
-        Command::Summarize(args) => {
-            let files = scoped_files(&root, &cli.project, cli.all_projects, Some(&args.session))?;
-            let file = select_session(&files, &args.session)?;
-            let digest = session_digest(file, args.opening, args.milestones)?;
-            print_digest(&digest, args.json)?;
-        }
-        Command::Sessions(args) => {
-            let projects = select_projects(&root, &cli.project, cli.all_projects)?;
-            let files = session_files(&projects)?;
-            let filter = args.filter.as_deref().map(str::to_lowercase);
-            let mut listed = Vec::new();
-            for file in files {
-                let title = session_title(&file)?;
-                let matches = filter.as_ref().is_none_or(|filter| {
-                    format!(
-                        "{} {} {} {} {}",
-                        file.project, file.cwd, file.session, file.started_at, title
-                    )
-                    .to_lowercase()
-                    .contains(filter)
-                });
-                if matches {
-                    listed.push((file, title));
-                }
-                if args.limit > 0 && listed.len() >= args.limit {
-                    break;
-                }
-            }
-            let rows = listed
-                .iter()
-                .map(|(file, title)| SessionRow {
-                    project: &file.project,
-                    cwd: &file.cwd,
-                    session: &file.session,
-                    started_at: &file.started_at,
-                    bytes: file.bytes,
-                    title,
-                    path: file.path.to_string_lossy().into_owned(),
-                })
-                .collect::<Vec<_>>();
-            print_sessions(&rows, args.json)?;
-        }
-        Command::Projects(args) => {
-            let selectors = cli
-                .project
-                .iter()
-                .chain(args.filter.iter())
-                .map(|value| value.to_lowercase())
-                .collect::<Vec<_>>();
-            let projects = discover_projects(&root)?
-                .into_iter()
-                .filter(|project| {
-                    selectors.is_empty()
-                        || selectors.iter().any(|selector| {
-                            format!("{} {}", project.name, project.cwd)
-                                .to_lowercase()
-                                .contains(selector)
-                        })
-                })
-                .collect::<Vec<_>>();
-            let stats = projects
-                .par_iter()
-                .map(project_stats)
-                .collect::<Result<Vec<_>>>()?;
-            let rows = projects
-                .iter()
-                .zip(stats)
-                .map(|(project, (sessions, bytes))| ProjectRow {
-                    name: &project.name,
-                    cwd: &project.cwd,
-                    sessions,
-                    bytes,
-                })
-                .collect::<Vec<_>>();
-            print_projects(&rows, args.json)?;
         }
     }
     Ok(())
+}
+
+/// Human output names sessions by their shortest unique id prefix and
+/// folders by their shortest unique path suffix, across every root.
+fn display_names(roots: &[PathBuf], cwds: impl IntoIterator<Item = String>, json: bool) -> Names {
+    match json {
+        true => Names::default(),
+        false => {
+            let (ids, known) = catalog(roots);
+            let cwds = known.into_iter().chain(cwds).collect::<Vec<_>>();
+            Names::new(&ids, &cwds)
+        }
+    }
+}
+
+fn timeline_display(
+    names: &Names,
+    context: usize,
+    full: bool,
+    json: bool,
+    max_text: Option<usize>,
+    metadata_only: bool,
+) -> DisplayOptions<'_> {
+    DisplayOptions {
+        names,
+        query: None,
+        regex: false,
+        case_sensitive: false,
+        context,
+        full,
+        json,
+        max_text: json_text_limit(json, full, max_text),
+        metadata_only,
+    }
+}
+
+fn last_records(mut records: Vec<Record>, limit: usize) -> Vec<Record> {
+    if limit > 0 && records.len() > limit {
+        records.drain(..records.len() - limit);
+    }
+    records
 }
 
 fn json_text_limit(json: bool, full: bool, requested: Option<usize>) -> Option<usize> {
@@ -274,14 +368,12 @@ fn json_text_limit(json: bool, full: bool, requested: Option<usize>) -> Option<u
 }
 
 fn target_session_file(
-    root: &Path,
-    selectors: &[String],
-    all_projects: bool,
+    scope: &Scope<'_>,
     selector: Option<&str>,
     command: &str,
 ) -> Result<SessionFile> {
     if let Some(selector) = selector {
-        let files = scoped_files(root, selectors, all_projects, Some(selector))?;
+        let files = scoped_files(scope, Some(selector))?;
         return Ok(select_session(&files, selector)?.clone());
     }
     if let Some(file) = current_session_file() {
@@ -290,24 +382,21 @@ fn target_session_file(
     let selector = current_session_id().with_context(|| {
         format!("not running inside a Pi session; pass an explicit SESSION to {command}")
     })?;
-    let files = scoped_files(root, selectors, all_projects, Some(&selector))?;
+    let files = scoped_files(scope, Some(&selector))?;
     Ok(select_session(&files, &selector)?.clone())
 }
 
-fn scoped_files(
-    root: &Path,
-    selectors: &[String],
-    all_projects: bool,
-    session: Option<&str>,
-) -> Result<Vec<SessionFile>> {
+/// An explicit session id with no `-p` is looked up everywhere; anything
+/// else goes through the project scope.
+fn scoped_files(scope: &Scope<'_>, session: Option<&str>) -> Result<Vec<SessionFile>> {
     let exact_session = session.filter(|selector| !selector.eq_ignore_ascii_case("latest"));
-    if selectors.is_empty()
-        && !all_projects
+    if scope.selectors.is_empty()
+        && !scope.all_projects
         && let Some(selector) = exact_session
     {
-        return global_session_files(root, selector);
+        return global_session_files(scope.roots, selector);
     }
-    session_files(&select_projects(root, selectors, all_projects)?)
+    scope_files(scope.roots, scope.selectors, scope.all_projects)
 }
 
 fn is_broken_pipe(error: &anyhow::Error) -> bool {

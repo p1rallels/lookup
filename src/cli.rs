@@ -14,7 +14,7 @@ pub struct Cli {
         long,
         global = true,
         value_name = "DIR",
-        help = "Sessions root [default: ~/.pi/agent/sessions]"
+        help = "Sessions root [default: $PI_CODING_AGENT_DIR/sessions or ~/.pi/agent/sessions, plus $PI_CODING_AGENT_SESSION_DIR]"
     )]
     pub root: Option<PathBuf>,
 
@@ -24,7 +24,7 @@ pub struct Cli {
         global = true,
         action = clap::ArgAction::Append,
         value_name = "NAME",
-        help = "Project path/name substring; repeatable"
+        help = "Project path/name substring, or a folder (/, ~/, ./, ../) and its subfolders; repeatable"
     )]
     pub project: Vec<String>,
 
@@ -100,11 +100,20 @@ pub struct SearchArgs {
     )]
     pub exclude_session: Vec<String>,
 
-    #[arg(long, help = "Exclude the current working directory's active session")]
+    #[arg(
+        long,
+        help = "Exclude the current Pi session (PI_SESSION_ID/PI_SESSION_FILE), else the cwd's most recently written one"
+    )]
     pub exclude_active: bool,
 
     #[arg(long, value_name = "NAME", help = "Only matching tool calls/results")]
     pub tool: Option<String>,
+
+    #[arg(
+        long,
+        help = "Only failed tool results (isError); implies -k tool-result unless -k is given"
+    )]
+    pub errors: bool,
 
     #[arg(long, value_name = "DATE", help = "ISO date/timestamp lower bound")]
     pub since: Option<String>,
@@ -381,6 +390,20 @@ pub struct SessionsArgs {
     )]
     pub filter: Option<String>,
 
+    #[arg(
+        long,
+        value_name = "DATE",
+        help = "Sessions started at or after this ISO date/timestamp"
+    )]
+    pub since: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "DATE",
+        help = "Sessions started at or before this ISO date/timestamp"
+    )]
+    pub until: Option<String>,
+
     #[arg(long, help = "Emit machine-readable JSONL")]
     pub json: bool,
 }
@@ -480,6 +503,29 @@ mod tests {
         };
         assert_eq!(args.session, None);
         assert_eq!(args.limit, 20);
+    }
+
+    #[test]
+    fn parses_errors_and_session_bounds() {
+        let cli = Cli::try_parse_from(["lookup", "search", "exit", "--errors"]).unwrap();
+        let Command::Search(args) = cli.command else {
+            panic!("expected search command");
+        };
+        assert!(args.errors);
+        let cli = Cli::try_parse_from([
+            "lookup",
+            "-p",
+            "~/code/app",
+            "sessions",
+            "--since",
+            "2026-10-01",
+        ])
+        .unwrap();
+        assert_eq!(cli.project, ["~/code/app"]);
+        let Command::Sessions(args) = cli.command else {
+            panic!("expected sessions command");
+        };
+        assert_eq!(args.since.as_deref(), Some("2026-10-01"));
     }
 
     #[test]
