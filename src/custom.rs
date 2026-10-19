@@ -31,6 +31,9 @@ pub struct Msg {
     /// `ended` (a child's last words) or `died`; none for a normal message.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
+    /// An `ended` from a sub that went away mid-run, or after an aborted run.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub stopped: bool,
     /// A human sent it (`/msg` or the msg cli), not an agent.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub by_user: bool,
@@ -66,6 +69,7 @@ pub fn parse_msg(message: &Value) -> Option<Msg> {
         },
         to: text_field(message, "to"),
         kind: text_field(message, "kind"),
+        stopped: message.get("stopped").and_then(Value::as_bool) == Some(true),
         by_user: message.get("byUser").and_then(Value::as_bool) == Some(true),
         reply_to: text_field(message, "replyTo"),
     })
@@ -132,10 +136,19 @@ pub fn msg_label(msg: &Msg, session: &str, names: &Names) -> String {
         (true, via) => format!("user (via {via})"),
         (false, from) => from.to_owned(),
     };
-    match (msg.kind.as_deref(), msg.to.as_deref()) {
+    match (exit_kind(msg), msg.to.as_deref()) {
         (Some(kind), _) => format!("msg {sender} {kind}"),
         (None, Some(to)) => format!("msg {sender} → {}", party(to, None, session, names)),
         (None, None) => format!("msg {sender}"),
+    }
+}
+
+/// How a sub's exit reads: `stopped` for an `ended` that didn't finish its
+/// run, else msg's own kind (`ended`, `died`).
+pub fn exit_kind(msg: &Msg) -> Option<&str> {
+    match (msg.kind.as_deref(), msg.stopped) {
+        (Some("ended"), true) => Some("stopped"),
+        (kind, _) => kind,
     }
 }
 
@@ -211,6 +224,10 @@ mod tests {
     fn labels_messages_from_the_shown_sessions_side() {
         assert_eq!(label(json!({})), "msg scout → you");
         assert_eq!(label(json!({"kind": "ended"})), "msg scout ended");
+        assert_eq!(
+            label(json!({"kind": "ended", "stopped": true})),
+            "msg scout stopped"
+        );
         assert_eq!(label(json!({"kind": "died"})), "msg scout died");
         assert_eq!(
             label(json!({"from": {"id": "01a152a0-f00d-72aa-a896-d904c458282b"}, "byUser": true})),
