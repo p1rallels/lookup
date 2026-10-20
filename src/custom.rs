@@ -152,6 +152,13 @@ pub fn exit_kind(msg: &Msg) -> Option<&str> {
     }
 }
 
+/// A sub's exit as summarize's peers show it: `ended`, `stopped` or `died`.
+/// Any other kind is news about a live sub, not an exit: msg's `stalled`
+/// says a sub is stuck in one tool call.
+pub fn peer_exit(msg: &Msg) -> Option<&str> {
+    exit_kind(msg).filter(|kind| matches!(*kind, "ended" | "stopped" | "died"))
+}
+
 /// `relay 45% nudge`, `relay 48% reset #2`.
 pub fn relay_label(relay: &Relay) -> String {
     [Some(RELAY.to_owned()), percent(relay), relay.kind.clone()]
@@ -196,7 +203,7 @@ fn text_field(value: &Value, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        compaction_relay, content_text, msg_label, parse_msg, parse_relay, relay_label,
+        compaction_relay, content_text, msg_label, parse_msg, parse_relay, peer_exit, relay_label,
         reset_label, tool_messages,
     };
     use crate::naming::Names;
@@ -229,6 +236,7 @@ mod tests {
             "msg scout stopped"
         );
         assert_eq!(label(json!({"kind": "died"})), "msg scout died");
+        assert_eq!(label(json!({"kind": "stalled"})), "msg scout stalled");
         assert_eq!(
             label(json!({"from": {"id": "01a152a0-f00d-72aa-a896-d904c458282b"}, "byUser": true})),
             "msg user (via 01a152a0) → you"
@@ -241,6 +249,21 @@ mod tests {
             label(json!({"from": {"id": ME}, "to": "01a15301-0000", "byUser": true})),
             "msg user → 01a15301"
         );
+    }
+
+    #[test]
+    fn only_ended_stopped_and_died_are_a_subs_exit() {
+        let exit = |extra: serde_json::Value| {
+            peer_exit(&parse_msg(&message(extra)).unwrap()).map(str::to_owned)
+        };
+        assert_eq!(exit(json!({"kind": "ended"})).as_deref(), Some("ended"));
+        assert_eq!(
+            exit(json!({"kind": "ended", "stopped": true})).as_deref(),
+            Some("stopped")
+        );
+        assert_eq!(exit(json!({"kind": "died"})).as_deref(), Some("died"));
+        assert_eq!(exit(json!({"kind": "stalled"})), None);
+        assert_eq!(exit(json!({})), None);
     }
 
     #[test]

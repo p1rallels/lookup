@@ -16,7 +16,7 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use crate::{
     cli::{Kind, SortOrder},
     custom::{
-        MSG, Msg, RELAY, Relay, compaction_relay, content_text, exit_kind, parse_msg, parse_relay,
+        MSG, Msg, RELAY, Relay, compaction_relay, content_text, parse_msg, parse_relay, peer_exit,
         reset_label, tool_messages,
     },
     naming::{SHORT_ID, display_timestamp, iso_timestamp, short_id, unique_prefix_lengths},
@@ -743,7 +743,7 @@ fn note_msg(traffic: &mut MsgTraffic, msg: &Msg, session: &str) {
             let peer = peer(&mut traffic.peers, &msg.from.id);
             peer.got = peer.got.saturating_add(1);
             peer.name = msg.from.name.clone().or(peer.name.take());
-            peer.exit = exit_kind(msg).map(str::to_owned).or(peer.exit.take());
+            peer.exit = peer_exit(msg).map(str::to_owned).or(peer.exit.take());
         }
     }
 }
