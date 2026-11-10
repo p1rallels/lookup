@@ -771,7 +771,7 @@ mod tests {
         ["/x", "~", "~/x", ".", "..", "./x", "../x"]
             .iter()
             .for_each(|selector| assert!(is_path_like(selector), "{selector}"));
-        ["x", ".forks", "~x", "pfs-cli/.forks/1", "Desktop/cc/pi"]
+        ["x", ".forks", "~x", "pfs-cli/.forks/1", "code/pi"]
             .iter()
             .for_each(|selector| assert!(!is_path_like(selector), "{selector}"));
     }
